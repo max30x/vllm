@@ -97,6 +97,11 @@ class EngineCoreRequest(
     data_parallel_rank: int | None
     prompt_embeds: torch.Tensor | None = None
 
+    cache_key: str = '',
+    n_token_pinned: int = 0,
+    retention_period: int = 0,
+    cache_priority: int = 0,
+
     # Per-position mask for mixed-mode inputs (e.g chat completion with
     # prompt_embeds content parts). `True` means the position is a real
     # token ID; `False` means the position uses a pre-computed entry from

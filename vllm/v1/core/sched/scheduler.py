@@ -290,6 +290,9 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+    def unpin_cache(self, cache_key: str) -> None:
+        self.kv_cache_manager.unpin_cache(cache_key)
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -302,6 +305,10 @@ class Scheduler(SchedulerInterface):
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
+
+        if num_computed_tokens < request.n_token_pinned:
+            return request.n_token_pinned - num_computed_tokens
+
         # Perform block-aligned splitting at prefill phase, including:
         # * non-resumed requests: num_computed_tokens < num_prompt_tokens + 0
         # * resumed requests: num_computed_tokens < (

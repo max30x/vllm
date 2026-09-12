@@ -77,7 +77,15 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        cache_key: str = '',
+        n_token_pinned: int = 0,
+        retention_period: int = 0,
+        cache_priority: int = 0,
     ) -> None:
+        self.cache_key = cache_key
+        self.n_token_pinned = n_token_pinned
+        self.retention_period = retention_period
+        self.cache_priority = cache_priority
         self.request_id = request_id
         self.client_index = client_index
         self.priority = priority
@@ -195,7 +203,12 @@ class Request:
         cls,
         request: EngineCoreRequest,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None,
+        block_size: int,
     ) -> "Request":
+        n_token_pinned = request.n_token_pinned
+        if n_token_pinned > 0:
+            n_token_pinned = n_token_pinned // block_size * block_size
+        
         return cls(
             request_id=request.request_id,
             client_index=request.client_index,
@@ -215,6 +228,10 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            cache_key=request.cache_key,
+            n_token_pinned=n_token_pinned,
+            retention_period=request.retention_period,
+            cache_priority=request.cache_priority,
         )
 
     def append_output_token_ids(

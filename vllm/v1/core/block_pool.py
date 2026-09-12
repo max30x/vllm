@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
 from typing import Any
+from queue import PriorityQueue
+import time
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -20,6 +22,7 @@ from vllm.v1.core.kv_cache_utils import (
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    PinnedKVCacheBlockList,
     generate_block_hash_extra_keys,
     get_block_hash,
     get_group_id,
@@ -166,6 +169,11 @@ class BlockPool:
         # list of free blocks (including eviction candidates when caching is
         # enabled).
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+
+        self.free_block_pinned = dict()
+
+        self.cache_key_to_free_blk_lst = dict()
+        self.n_pinned_free_blk = 0
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -330,6 +338,27 @@ class BlockPool:
                 )
             )
 
+    def get_new_blocks_pinned(self, num_blocks: int) -> list[KVCacheBlock]:
+        ret = list()
+
+        now = time.time()
+        blks = list(self.free_block_pinned.values())
+        blks = sorted(blks, key=lambda i: blks[i].expired_at)
+        for blk in blks:
+            if blk < now:
+                ret.append(blk)
+                num_blocks -= 1
+
+        if num_blocks > 0:
+            blks = sorted(blks, key=lambda i: blks[i].priority)
+            ret.extend(blks[:num_blocks])
+
+        for blk in ret:
+            blk.pin_cnt = 0
+            self.free_block_pinned.pop(blk.block_id)
+            self.n_pinned_free_blk -= 1
+        return ret                 
+
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
@@ -344,7 +373,10 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        _n_blk = min(num_blocks, self.free_block_queue.num_free_blocks)
+        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(_n_blk)
+        if _n_blk < num_blocks:
+            ret.extend(self.get_new_blocks_pinned(num_blocks - _n_blk))
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -411,7 +443,10 @@ class BlockPool:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
-                self.free_block_queue.remove(block)
+                if block.pin_cnt:
+                    self.n_pinned_free_blk -= 1
+                else:
+                    self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -430,15 +465,72 @@ class BlockPool:
         """
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
+        freed_blocks = list()
         for block in blocks_list:
             block.ref_cnt -= 1
-        freed_blocks = [
-            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
-        ]
+            if block.ref_cnt == 0 and not block.is_null:
+                if block.pin_cnt:
+                    self.n_pinned_free_blk += 1
+                else:
+                    freed_blocks.append(block)
+
         if prepend:
             self.free_block_queue.prepend_n(freed_blocks)
         else:
             self.free_block_queue.append_n(freed_blocks)
+
+    def free_blocks_pinned(
+        self, 
+        cache_key: str, 
+        ordered_blocks: Iterable[KVCacheBlock],
+    ) -> None:
+        blk_list = list(ordered_blocks)
+        freed_blocks = list()
+        for block in blk_list:
+            block.ref_cnt -= 1
+            if block.ref_cnt != 0 or block.is_null:
+                continue
+            if block.pin_cnt:
+                self.n_pinned_free_blk += 1
+            else:
+                freed_blocks.append(block)                
+
+        if not freed_blocks:
+            return
+
+        if cache_key in self.cache_key_to_free_blk_lst:
+            blks = self.cache_key_to_free_blk_lst[cache_key]
+            blk_list = blk_list.extend(blks)
+            self.cache_key_to_free_blk_lst[cache_key] = blk_list
+        else:
+            self.cache_key_to_free_blk_lst[cache_key] = freed_blocks
+
+    def commit_blocks_pinned(self, cache_key: str, retention_period: int, cache_priority: int):
+        if cache_key not in self.cache_key_to_free_blk_lst:
+            return
+        expired_at = time.time() + retention_period
+
+        blks = self.cache_key_to_free_blk_lst[cache_key]
+        for blk in blks:
+            if blk.pin_cnt == 0:
+                self.n_pinned_free_blk += 1
+            blk.pin_cnt += 1
+            blk.expired_at = max(blk.expired_at, expired_at)
+            blk.priority = max(blk.priority, cache_priority)
+            self.free_block_pinned[blk.block_id] = blk
+
+    def unpin_cache(self, cache_key: str) -> None:
+        if cache_key not in self.cache_key_to_free_blk_lst:
+            return
+
+        blks = self.cache_key_to_free_blk_lst[cache_key]
+        self.cache_key_to_free_blk_lst.pop(cache_key)
+        for i in range(len(blks) - 1, -1 , -1):
+            blks[i].pin_cnt -= 1
+            if blks[i].ref_cnt == 0 and blks[i].pin_cnt == 0:
+                self.free_block_queue.append(blks[i])
+                self.free_block_pinned.pop(blks[i].block_id)
+                self.n_pinned_free_blk -= 1       
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -500,7 +592,7 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
-        return self.free_block_queue.num_free_blocks
+        return self.free_block_queue.num_free_blocks + self.n_pinned_free_blk
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

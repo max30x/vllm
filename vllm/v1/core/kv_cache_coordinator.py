@@ -214,7 +214,7 @@ class KVCacheCoordinator(ABC):
         request_id: str,
         num_tokens: int,
         num_tokens_main_model: int,
-        num_encoder_tokens: int = 0,
+        num_encoder_tokens: int,
     ) -> tuple[list[KVCacheBlock], ...]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -261,7 +261,17 @@ class KVCacheCoordinator(ABC):
                 retention_interval=self.retention_interval,
             )
 
-    def free(self, request_id: str) -> None:
+    def unpin_cache(self, cache_key: str) -> None:
+        self.block_pool.unpin_cache(cache_key)
+
+    def free(
+        self, 
+        request_id: str, 
+        cache_key: str, 
+        n_token_pinned: int, 
+        retention_period: int,
+        cache_priority: int,
+    ) -> None:
         """
         Free the blocks for the request.
 
@@ -269,7 +279,7 @@ class KVCacheCoordinator(ABC):
             request_id: The request ID.
         """
         for manager in self.single_type_managers:
-            manager.free(request_id)
+            manager.free(request_id, cache_key, n_token_pinned, retention_period, cache_priority)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """
@@ -289,7 +299,7 @@ class KVCacheCoordinator(ABC):
         ]
 
     def remove_skipped_blocks(
-        self, request_id: str, total_computed_tokens: int
+        self, request_id: str, total_computed_tokens: int, cache_key: str, n_token_pinned
     ) -> None:
         """
         Remove the blocks that are no longer needed from `blocks` and replace
@@ -301,7 +311,7 @@ class KVCacheCoordinator(ABC):
                 local computed tokens and external computed tokens.
         """
         for manager in self.single_type_managers:
-            manager.remove_skipped_blocks(request_id, total_computed_tokens)
+            manager.remove_skipped_blocks(request_id, total_computed_tokens, cache_key, n_token_pinned)
 
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """

@@ -257,7 +257,10 @@ class SingleTypeKVCacheManager(ABC):
                 self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+        self, 
+        request_id: str, 
+        num_tokens: int, 
+        num_tokens_main_model: int, 
     ) -> list[KVCacheBlock]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -360,7 +363,14 @@ class SingleTypeKVCacheManager(ABC):
         """
         return None
 
-    def free(self, request_id: str) -> None:
+    def free(
+        self, 
+        request_id: str, 
+        cache_key: str, 
+        n_token_pinned: int, 
+        retention_period: int,
+        cache_priority: int,
+    ) -> None:
         """
         Free the blocks for the request.
 
@@ -372,9 +382,18 @@ class SingleTypeKVCacheManager(ABC):
 
         # Free blocks in reverse order so that the tail blocks are
         # freed first.
-        ordered_blocks = reversed(req_blocks)
+        ordered_blocks = list(reversed(req_blocks))
 
-        self.block_pool.free_blocks(ordered_blocks)
+        n_blk_pinned = n_token_pinned // self.block_size
+        n_blk_pinned = min(n_blk_pinned, len(ordered_blocks))
+
+        self.block_pool.free_blocks(ordered_blocks[n_blk_pinned:])
+        if n_blk_pinned:
+            if ordered_blocks[n_blk_pinned - 1].block_hash is None:
+                n_blk_pinned -= 1
+            self.block_pool.free_blocks_pinned(
+                cache_key, ordered_blocks[:n_blk_pinned])
+        self.block_pool.commit_blocks_pinned(retention_period, cache_priority)
         self.num_cached_block.pop(request_id, None)
 
     @abstractmethod
@@ -446,7 +465,7 @@ class SingleTypeKVCacheManager(ABC):
         raise NotImplementedError
 
     def remove_skipped_blocks(
-        self, request_id: str, total_computed_tokens: int
+        self, request_id: str, total_computed_tokens: int, cache_key: str, n_token_pinned: int
     ) -> None:
         """
         Remove and free the blocks that are no longer needed for attention computation.
@@ -476,11 +495,14 @@ class SingleTypeKVCacheManager(ABC):
         # this request.
         num_skipped_blocks = min(num_skipped_blocks, len(blocks))
 
+        num_pinned_blocks = n_token_pinned // self.block_size
+
         # Reuse skipped local blocks in order:
         #   scratch blocks: no prefix-cache value, reuse first.
         #   cached blocks: reusable prefix-cache value, reuse last.
         removed_cached_blocks: list[KVCacheBlock] = []
         removed_uncached_blocks: list[KVCacheBlock] = []
+        removed_pinned_blocks: list[KVCacheBlock] = []
         # Because the block starts from index 0, the num_skipped_block-th block
         # corresponds to index num_skipped_blocks - 1.
         for i in range(num_skipped_blocks - 1, -1, -1):
@@ -489,16 +511,20 @@ class SingleTypeKVCacheManager(ABC):
                 # should also have been set to null blocks by the previous calls
                 # to this function.
                 break
-            if blocks[i].block_hash is None:
-                removed_uncached_blocks.append(blocks[i])
+            if blocks[i].block_hash is not None:
+                if i < num_pinned_blocks:
+                    removed_pinned_blocks.append(blocks[i])
+                else:
+                    removed_cached_blocks.append(blocks[i])
             else:
-                removed_cached_blocks.append(blocks[i])
+                removed_uncached_blocks.append(blocks[i])
             blocks[i] = self._null_block
         # `prepend=True` makes uncached scratch blocks the next allocation
         # candidates, while cached blocks stay behind them as best-effort
         # prefix-cache entries.
         self.block_pool.free_blocks(removed_cached_blocks)
         self.block_pool.free_blocks(removed_uncached_blocks, prepend=True)
+        self.block_pool.free_blocks_pinned(cache_key, removed_pinned_blocks)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
@@ -748,7 +774,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
 
         return mask
 
-    def free(self, request_id: str) -> None:
+    def free(self, request_id: str, cache_key: str, n_token_pinned: int, retention_period: int) -> None:
         # similar to remove_skipped_blocks(), prepend the uncached blocks
         # and append the cached blocks to the free queue
         req_blocks = self.req_to_blocks.pop(request_id, [])
@@ -1015,7 +1041,13 @@ class MambaManager(SingleTypeKVCacheManager):
 
         return computed_blocks
 
-    def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:
+    def remove_skipped_blocks(
+        self, 
+        request_id: str, 
+        num_computed_tokens: int, 
+        cache_key: str, 
+        n_token_pinned: int
+    ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
 
         # NOTE (tdoublep) with async scheduling, the num_computed_tokens can contain
@@ -1025,7 +1057,7 @@ class MambaManager(SingleTypeKVCacheManager):
         # that we might actually need.
         num_computed_tokens = max(0, num_computed_tokens - self.num_speculative_blocks)
 
-        super().remove_skipped_blocks(request_id, num_computed_tokens)
+        super().remove_skipped_blocks(request_id, num_computed_tokens, cache_key, n_token_pinned)
         if self.mamba_cache_mode == "align":
             # `last_state_block_idx` refers to the block index allocated two steps ago.
             # The block allocated in the previous step is used to copy Mamba states
@@ -1119,7 +1151,10 @@ class MambaManager(SingleTypeKVCacheManager):
             return num_new_blocks + num_evictable_computed_blocks
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+        self, 
+        request_id: str, 
+        num_tokens: int, 
+        num_tokens_main_model: int,
     ) -> list[KVCacheBlock]:
         assert isinstance(self.kv_cache_spec, MambaSpec)
         if self.mamba_cache_mode != "align":
@@ -1194,11 +1229,11 @@ class MambaManager(SingleTypeKVCacheManager):
                 self._allocated_block_reqs.add(request_id)
                 return req_blocks[prev_block_len:]
 
-    def free(self, request_id: str) -> None:
+    def free(self, request_id: str, cache_key: str, n_token_pinned: int, retention_period: int) -> None:
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
-        super().free(request_id)
+        super().free(request_id, cache_key, n_token_pinned, retention_period)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """

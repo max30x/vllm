@@ -379,7 +379,7 @@ class KVCacheManager:
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
         self.coordinator.remove_skipped_blocks(
-            request.request_id, total_computed_tokens
+            request.request_id, total_computed_tokens, request.cache_key, request.n_token_pinned
         )
 
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
@@ -435,6 +435,10 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
+    def unpin_cache(self, cache_key: str) -> None:
+        self.coordinator.unpin_cache(cache_key)
+
+
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
@@ -443,7 +447,13 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
-        self.coordinator.free(request.request_id)
+        self.coordinator.free(
+            request.request_id, 
+            request.cache_key, 
+            request.n_token_pinned, 
+            request.retention_period,
+            request.cache_priority,
+        )
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
