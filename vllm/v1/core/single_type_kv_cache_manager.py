@@ -1074,7 +1074,11 @@ class MambaManager(SingleTypeKVCacheManager):
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
+                    num_pinned_blocks = n_token_pinned // self.block_size
+                    if last_state_block_idx + 1 == num_pinned_blocks:
+                        self.block_pool.free_blocks_pinned(cache_key, [blocks[last_state_block_idx]])
+                    else:
+                        self.block_pool.free_blocks([blocks[last_state_block_idx]])
                     blocks[last_state_block_idx] = self._null_block
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
